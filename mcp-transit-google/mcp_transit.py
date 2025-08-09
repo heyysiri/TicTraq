@@ -446,10 +446,38 @@ async def transit_route(
     if depart_at_iso and arrive_by_iso:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="Specify only one of depart_at_iso or arrive_by_iso"))
 
+    # If explicitly using metro, ensure queries target metro stations when users omit the phrase
+    def _is_lat_lng(text: str | None) -> bool:
+        if not text or "," not in text:
+            return False
+        try:
+            lat_str, lng_str = text.split(",", 1)
+            float(lat_str.strip())
+            float(lng_str.strip())
+            return True
+        except Exception:
+            return False
+
+    def _ensure_metro_station_suffix(place: str) -> str:
+        # Do not modify coordinates; only append if phrase is missing (case-insensitive)
+        if _is_lat_lng(place):
+            return place
+        if "metro station" or "metro" in place.lower():
+            return place
+        return f"{place} metro station"
+
+    adjusted_origin = parsed_origin
+    adjusted_destination = parsed_destination
+    if mode == "metro":
+        if adjusted_origin:
+            adjusted_origin = _ensure_metro_station_suffix(adjusted_origin)
+        if adjusted_destination:
+            adjusted_destination = _ensure_metro_station_suffix(adjusted_destination)
+
     # Prefer Routes v2 given user's request structure and times
     routes_v2 = await call_google_routes_v2(
-        origin=parsed_origin,
-        destination=parsed_destination,
+        origin=adjusted_origin,
+        destination=adjusted_destination,
         mode=mode,
         max_plans=max_plans,
         depart_at_iso=depart_at_iso,
@@ -465,8 +493,8 @@ async def transit_route(
 
     # Convert to serializable dict
     return {
-        "origin": parsed_origin,
-        "destination": parsed_destination,
+        "origin": adjusted_origin,
+        "destination": adjusted_destination,
         "plans": [p.model_dump() for p in plans],
     }
 
