@@ -1,8 +1,8 @@
 import asyncio
 import os
-from datetime import datetime, timezone
-from typing import Annotated, Literal
-
+from datetime import datetime
+from typing import Annotated, Literal, Any
+import json
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -69,40 +69,170 @@ class TransitPlan(BaseModel):
     steps: list[TransitStep]
 
 
-async def call_google_directions(
+
+
+def _routes_v2_origin_or_dest(text: str) -> dict[str, Any]:
+    # Accept "lat,lng" or free-text address
+    if "," in text:
+        try:
+            lat_str, lng_str = text.split(",", 1)
+            return {
+                "location": {
+                    "latLng": {
+                        "latitude": float(lat_str.strip()),
+                        "longitude": float(lng_str.strip()),
+                    }
+                }
+            }
+        except Exception:
+            pass
+    return {"address": text}
+
+
+async def call_google_routes_v2(
     *,
     origin: str,
     destination: str,
-    transit_mode: str | None,
-    departure_time_epoch: int | None,
-    arrival_time_epoch: int | None,
+    mode: str | None,
+    max_plans: int,
+    depart_at_iso: str | None,
     language: str | None,
     region: str | None,
 ) -> dict:
-    params: dict[str, str] = {
-        "origin": origin,
-        "destination": destination,
-        "mode": "transit",
-        "key": GOOGLE_MAPS_API_KEY,
+    # Build body following user's sample, but map allowedTravelModes correctly
+    body: dict[str, Any] = {
+        "origin": _routes_v2_origin_or_dest(origin),
+        "destination": _routes_v2_origin_or_dest(destination),
+        "travelMode": "TRANSIT",
+        "computeAlternativeRoutes": bool(max_plans and max_plans > 1),
+        "transitPreferences": {
+            "routingPreference": "LESS_WALKING",
+        },
     }
-    if transit_mode:
-        params["transit_mode"] = transit_mode
-    if departure_time_epoch is not None:
-        params["departure_time"] = str(departure_time_epoch)
-    if arrival_time_epoch is not None:
-        params["arrival_time"] = str(arrival_time_epoch)
+    if depart_at_iso:
+        body["departureTime"] = {"time": depart_at_iso}
+
+    # Map mode → allowedTravelModes
+    allowed: list[str] | None = None
+    if mode:
+        m = mode.lower()
+        if m in ("metro", "subway"):
+            allowed = ["SUBWAY"]
+        elif m == "bus":
+            allowed = ["BUS"]
+        elif m == "train":
+            allowed = ["TRAIN"]
+        elif m == "tram":
+            allowed = ["TRAM"]
+        elif m == "rail":
+            allowed = ["RAIL", "TRAIN"]
+    if allowed:
+        body["transitPreferences"]["allowedTravelModes"] = allowed
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+        # Wide mask to include all transitDetails needed for times
+        "X-Goog-FieldMask": "routes.legs.steps.transitDetails,routes.duration,routes.distanceMeters",
+    }
+    params: dict[str, str] = {}
     if language:
-        params["language"] = language
+        params["languageCode"] = language
     if region:
-        params["region"] = region
+        params["regionCode"] = region
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
+        resp = await client.post(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            headers=headers,
+            params=params,
+            json=body,
+        )
         data = resp.json()
-        if data.get("status") != "OK":
-            message = data.get("error_message") or data.get("status") or "Unknown error"
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Google Directions error: {message}"))
+        # Write raw response for debugging like user's workflow
+        try:
+            with open("response.json", "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
         return data
+
+
+def _fmt_hhmm(dt_str: str | None) -> str | None:
+    if not dt_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%I:%M %p")
+    except Exception:
+        return dt_str
+
+
+def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
+    plans: list[TransitPlan] = []
+    for route in (resp.get("routes") or []):
+        legs = route.get("legs", []) or []
+        steps_models: list[TransitStep] = []
+        first_dep: str | None = None
+        last_arr: str | None = None
+        summary_parts: list[str] = []
+
+        for leg in legs:
+            for step in leg.get("steps", []) or []:
+                travel_mode = step.get("travelMode")
+                if travel_mode == "WALK":
+                    summary_parts.append("Walk")
+                    continue
+                if travel_mode != "TRANSIT":
+                    continue
+                td = step.get("transitDetails", {}) or {}
+                sd = td.get("stopDetails", {}) or {}
+                raw_dep = sd.get("departureTime")
+                raw_arr = sd.get("arrivalTime")
+                dep_time = raw_dep
+                arr_time = raw_arr
+
+                if dep_time and first_dep is None:
+                    first_dep = dep_time
+                if arr_time:
+                    last_arr = arr_time
+
+                steps_models.append(
+                    TransitStep(
+                        vehicle="TRANSIT",
+                        line_name=None,
+                        headsign=None,
+                        num_stops=None,
+                        departure_stop=None,
+                        arrival_stop=None,
+                        departure_time_local=_fmt_hhmm(raw_dep),
+                        arrival_time_local=_fmt_hhmm(raw_arr),
+                    )
+                )
+                summary_parts.append("Transit")
+
+        # Manual duration from first/last times
+        duration_text: str | None = None
+        if first_dep and last_arr:
+            try:
+                dt_dep = datetime.fromisoformat(first_dep.replace("Z", "+00:00"))
+                dt_arr = datetime.fromisoformat(last_arr.replace("Z", "+00:00"))
+                mins = round((dt_arr - dt_dep).total_seconds() / 60)
+                duration_text = f"{mins} mins"
+            except Exception:
+                duration_text = None
+
+        plans.append(
+            TransitPlan(
+                summary=" › ".join(p for p in summary_parts if p) or "Transit plan",
+                departure_time_local=_fmt_hhmm(first_dep),
+                arrival_time_local=_fmt_hhmm(last_arr),
+                duration_text=duration_text,
+                fare_text=None,
+                steps=steps_models,
+            )
+        )
+    return plans
 
 
 def _format_epoch_to_iso_local(value: int) -> str:
@@ -121,7 +251,14 @@ def extract_transit_plans(directions: dict) -> list[TransitPlan]:
             arr_time = leg.get("arrival_time", {}).get("value")
             dep_text = leg.get("departure_time", {}).get("text")
             arr_text = leg.get("arrival_time", {}).get("text")
-            duration_text = leg.get("duration", {}).get("text")
+            # Prefer manual duration from arrival - departure to avoid API text inconsistencies
+            duration_text = None
+            if isinstance(dep_time, int) and isinstance(arr_time, int) and arr_time >= dep_time:
+                mins = round((arr_time - dep_time) / 60)
+                duration_text = f"{mins} mins"
+            else:
+                print("going into else")
+                duration_text = leg.get("duration", {}).get("text")
 
             fare_text = None
             if route.get("fare") and route["fare"].get("text"):
@@ -288,37 +425,17 @@ async def transit_route(
     if depart_at_iso and arrive_by_iso:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="Specify only one of depart_at_iso or arrive_by_iso"))
 
-    departure_time_epoch: int | None = None
-    arrival_time_epoch: int | None = None
-    if arrive_by_iso:
-        # Interpret as local time string; let Python parse safely
-        try:
-            # naive -> local; then convert to epoch seconds
-            naive = datetime.fromisoformat(arrive_by_iso)
-            arrival_time_epoch = int(naive.replace(tzinfo=None).timestamp())
-        except Exception as e:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid arrive_by_iso: {e}"))
-    elif depart_at_iso:
-        try:
-            naive = datetime.fromisoformat(depart_at_iso)
-            departure_time_epoch = int(naive.replace(tzinfo=None).timestamp())
-        except Exception as e:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid depart_at_iso: {e}"))
-    else:
-        # default: now
-        departure_time_epoch = int(datetime.now(timezone.utc).timestamp())
-
-    directions = await call_google_directions(
+    # Prefer Routes v2 given user's request structure and times
+    routes_v2 = await call_google_routes_v2(
         origin=parsed_origin,
         destination=parsed_destination,
-        transit_mode=transit_mode,
-        departure_time_epoch=departure_time_epoch,
-        arrival_time_epoch=arrival_time_epoch,
+        mode=mode,
+        max_plans=max_plans,
+        depart_at_iso=depart_at_iso,
         language=language,
         region=region,
     )
-
-    plans = extract_transit_plans(directions)
+    plans = extract_transit_plans_from_routes(routes_v2)
     if not plans:
         return {"message": "No transit plans found"}
 
