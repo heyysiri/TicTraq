@@ -1,167 +1,128 @@
-# MCP Starter for Puch AI
+## Google Transit MCP Server -- TicTraq
 
-This is a starter template for creating your own Model Context Protocol (MCP) server that works with Puch AI. It comes with ready-to-use tools for job searching and image processing.
+A Model Context Protocol (MCP) server that returns upcoming public transit route options using Google Routes API v2 (Directions). It surfaces localized departure/arrival times and computes duration strictly as arrival minus departure.
 
-## What is MCP?
+### Key features
+- **Localized times**: `departure_time_local` and `arrival_time_local` come from Google's `localizedValues` and are shown exactly as returned in the requested language/locale.
+- **Accurate duration**: `duration_text` is computed as minutes between ISO `arrivalTime` and `departureTime` from the API; it does not use the API's generic `duration` label.
+- **Mode filtering**: Optional `mode` parameter to target specific transit types; special handling for `metro` queries to improve results.
+- **Robust parsing**: Detects transit steps via `transitDetails` so field masks don't omit critical fields.
 
-MCP (Model Context Protocol) allows AI assistants like Puch to connect to external tools and data sources safely. Think of it like giving your AI extra superpowers without compromising security.
+## Prerequisites
+- Python 3.11+
+- A Google Maps Platform API key with access to Directions (Routes v2)
 
-## What's Included in This Starter?
-
-### 🎯 Job Finder Tool
-- **Analyze job descriptions** - Paste any job description and get smart insights
-- **Fetch job postings from URLs** - Give a job posting link and get the full details
-- **Search for jobs** - Use natural language to find relevant job opportunities
-
-### 🖼️ Image Processing Tool
-- **Convert images to black & white** - Upload any image and get a monochrome version
-
-### 🔐 Built-in Authentication
-- Bearer token authentication (required by Puch AI)
-- Validation tool that returns your phone number
-
-## Quick Setup Guide
-
-### Step 1: Install Dependencies
-
-First, make sure you have Python 3.11 or higher installed. Then:
+## Setup
+1. Create and activate a virtual environment, then install dependencies (uses `uv`):
 
 ```bash
-# Create virtual environment
 uv venv
-
-# Install all required packages
 uv sync
-
-# Activate the environment
 source .venv/bin/activate
 ```
 
-### Step 2: Set Up Environment Variables
-
-Create a `.env` file in the project root:
+2. Create a `.env` in the project root:
 
 ```bash
-# Copy the example file
 cp .env.example .env
 ```
 
-Then edit `.env` and add your details:
+3. Fill in the environment variables:
 
 ```env
-AUTH_TOKEN=your_secret_token_here
-MY_NUMBER=919876543210
+AUTH_TOKEN=<your-auth-token>
+GOOGLE_MAPS_API_KEY=<your-google-maps-api-key>
+# Optional, used by the validate tool
+MY_NUMBER=91<your-number>
 ```
 
-**Important Notes:**
-- `AUTH_TOKEN`: This is your secret token for authentication. Keep it safe!
-- `MY_NUMBER`: Your WhatsApp number in format `{country_code}{number}` (e.g., `919876543210` for +91-9876543210)
-
-### Step 3: Run the Server
+## Run the server
 
 ```bash
-cd mcp-bearer-token
-python mcp_starter.py
+python mcp-transit-google/mcp_transit.py
 ```
 
-You'll see: `🚀 Starting MCP server on http://0.0.0.0:8086`
-
-### Step 4: Make It Public (Required by Puch)
-
-Since Puch needs to access your server over HTTPS, you need to expose your local server:
-
-#### Option A: Using ngrok (Recommended)
-
-1. **Install ngrok:**
-   Download from https://ngrok.com/download
-
-2. **Get your authtoken:**
-   - Go to https://dashboard.ngrok.com/get-started/your-authtoken
-   - Copy your authtoken
-   - Run: `ngrok config add-authtoken YOUR_AUTHTOKEN`
-
-3. **Start the tunnel:**
-   ```bash
-   ngrok http 8086
-   ```
-
-#### Option B: Deploy to Cloud
-
-You can also deploy this to services like:
-- Railway
-- Render
-- Heroku
-- DigitalOcean App Platform
-
-## How to Connect with Puch AI
-
-1. **[Open Puch AI](https://wa.me/+919998881729)** in your browser
-2. **Start a new conversation**
-3. **Use the connect command:**
-   ```
-   /mcp connect https://your-domain.ngrok.app/mcp your_secret_token_here
-   ```
-
-### Debug Mode
-
-To get more detailed error messages:
+Expected output:
 
 ```
-/mcp diagnostics-level debug
+🚦 Starting Google Transit MCP server on http://0.0.0.0:8087
 ```
 
-## Customizing the Starter
+To expose it publicly (required for remote clients), use a tunnel like ngrok:
 
-### Adding New Tools
+```bash
+ngrok http 8087
+```
 
-1. **Create a new tool function:**
-   ```python
-   @mcp.tool(description="Your tool description")
-   async def your_tool_name(
-       parameter: Annotated[str, Field(description="Parameter description")]
-   ) -> str:
-       # Your tool logic here
-       return "Tool result"
-   ```
+Then connect your MCP client to `https://<your-ngrok-domain>/mcp` using your `AUTH_TOKEN`.
 
-2. **Add required imports** if needed
+## Tools
+
+### validate()
+Simple health check. Returns `MY_NUMBER` if set, otherwise `google-transit:ok`.
+
+### transit_route(...)
+Finds upcoming transit route options. Parameters:
+
+- `user_question` (str, required): Freeform text, e.g. "metro to Habsiguda from Parade Ground".
+- `origin` (str | None): Address or `lat,lng`. Optional if inferable from `user_question`.
+- `destination` (str | None): Address or `lat,lng`. Optional if inferable.
+- `mode` (Literal["bus", "subway", "train", "tram", "rail", "metro"] | None): Filter to a specific mode.
+- `depart_at_iso` (str | None): Desired departure time in ISO8601 local time. Mutually exclusive with `arrive_by_iso`.
+- `arrive_by_iso` (str | None): Desired arrival deadline in ISO8601 local time. Mutually exclusive with `depart_at_iso`.
+- `language` (str | None, default: "en"): Response language code.
+- `region` (str | None, default: "IN"): Region bias code.
+- `max_plans` (int, default: 3): Maximum number of plans to return.
+
+Behavioral notes:
+- If both `depart_at_iso` and `arrive_by_iso` are provided, the server returns an error.
+- When `mode == "metro"` and the input is free-text (not coordinates), the server appends "metro station" to origin/destination if not already present, e.g. `"Habsiguda" → "Habsiguda metro station"`, to improve accuracy. Coordinates are left unchanged.
+
+## Response schema
+
+```json
+{
+  "origin": "Parade Ground metro station",
+  "destination": "Habsiguda metro station",
+  "plans": [
+    {
+      "summary": "SUBWAY: Blue Line → Nagole",
+      "departure_time_local": "PM ৫.২৮", // from localizedValues (example locale)
+      "arrival_time_local": "PM ৫.৩৮",   // from localizedValues (example locale)
+      "duration_text": "10 mins",        // computed = arrival - departure
+      "fare_text": null,
+      "steps": [
+        {
+          "vehicle": "SUBWAY",
+          "line_name": "Blue Line",
+          "headsign": "Nagole",
+          "num_stops": 5,
+          "departure_stop": "Parade Ground",
+          "arrival_stop": "Habsiguda",
+          "departure_time_local": "PM ৫.২৮", // localized string
+          "arrival_time_local": "PM ৫.৩৮"    // localized string
+        }
+      ]
+    }
+  ]
+}
+```
+
+Field meanings:
+- **departure_time_local / arrival_time_local**: Localized strings for display, taken from `transitDetails.localizedValues.(departureTime|arrivalTime).time.text`.
+- **duration_text**: Minutes between ISO `stopDetails.departureTime` and `stopDetails.arrivalTime` (e.g., `"10 mins"`).
+- **vehicle / line_name / headsign / num_stops / stops**: Taken from `transitDetails.transitLine`, `transitDetails.headsign`, and `transitDetails.stopCount/stopDetails`.
+
+## Troubleshooting
+- Ensure `.env` has valid `AUTH_TOKEN` and `GOOGLE_MAPS_API_KEY`.
+- If you get "No transit plans found", try specifying `mode`, adjusting `origin`/`destination`, or checking that public transit is available for the route/time.
+- If you need to debug the raw Google API response, you can temporarily write it to `response.json` by uncommenting the lines in `call_google_routes_v2` that dump the response.
+- Network access to `routes.googleapis.com` must be allowed from your environment.
+
+## Security
+- Keep `AUTH_TOKEN` and `GOOGLE_MAPS_API_KEY` secret and out of version control.
+
+## License
+See `LICENSE` in the repository root.
 
 
-## 📚 **Additional Documentation Resources**
-
-### **Official Puch AI MCP Documentation**
-- **Main Documentation**: https://puch.ai/mcp
-- **Protocol Compatibility**: Core MCP specification with Bearer & OAuth support
-- **Command Reference**: Complete MCP command documentation
-- **Server Requirements**: Tool registration, validation, HTTPS requirements
-
-### **Technical Specifications**
-- **JSON-RPC 2.0 Specification**: https://www.jsonrpc.org/specification (for error handling)
-- **MCP Protocol**: Core protocol messages, tool definitions, authentication
-
-### **Supported vs Unsupported Features**
-
-**✓ Supported:**
-- Core protocol messages
-- Tool definitions and calls
-- Authentication (Bearer & OAuth)
-- Error handling
-
-**✗ Not Supported:**
-- Videos extension
-- Resources extension
-- Prompts extension
-
-## Getting Help
-
-- **Join Puch AI Discord:** https://discord.gg/VMCnMvYx
-- **Check Puch AI MCP docs:** https://puch.ai/mcp
-- **Puch WhatsApp Number:** +91 99988 81729
-
----
-
-**Happy coding! 🚀**
-
-Use the hashtag `#BuildWithPuch` in your posts about your MCP!
-
-This starter makes it super easy to create your own MCP server for Puch AI. Just follow the setup steps and you'll be ready to extend Puch with your custom tools!
