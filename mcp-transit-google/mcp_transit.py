@@ -150,11 +150,11 @@ async def call_google_routes_v2(
         )
         data = resp.json()
         # Write raw response for debugging like user's workflow
-        try:
-            with open("response.json", "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
+        # try:
+        #     with open("response.json", "w") as f:
+        #         json.dump(data, f, indent=2)
+        # except Exception:
+        #     pass
         return data
 
 
@@ -173,50 +173,70 @@ def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
     for route in (resp.get("routes") or []):
         legs = route.get("legs", []) or []
         steps_models: list[TransitStep] = []
-        first_dep: str | None = None
-        last_arr: str | None = None
+        first_dep_iso: str | None = None
+        last_arr_iso: str | None = None
+        first_dep_local_text: str | None = None
+        last_arr_local_text: str | None = None
         summary_parts: list[str] = []
 
         for leg in legs:
             for step in leg.get("steps", []) or []:
-                travel_mode = step.get("travelMode")
-                if travel_mode == "WALK":
-                    summary_parts.append("Walk")
+                # Detect transit steps by presence of transitDetails (travelMode may be omitted by field mask)
+                td = step.get("transitDetails") or {}
+                if not td:
                     continue
-                if travel_mode != "TRANSIT":
-                    continue
-                td = step.get("transitDetails", {}) or {}
                 sd = td.get("stopDetails", {}) or {}
-                raw_dep = sd.get("departureTime")
-                raw_arr = sd.get("arrivalTime")
-                dep_time = raw_dep
-                arr_time = raw_arr
+                raw_dep_iso = sd.get("departureTime")
+                raw_arr_iso = sd.get("arrivalTime")
 
-                if dep_time and first_dep is None:
-                    first_dep = dep_time
-                if arr_time:
-                    last_arr = arr_time
+                # Localized time strings (display as-is to the user)
+                loc = td.get("localizedValues", {}) or {}
+                dep_local_text = (
+                    ((loc.get("departureTime") or {}).get("time") or {}).get("text")
+                )
+                arr_local_text = (
+                    ((loc.get("arrivalTime") or {}).get("time") or {}).get("text")
+                )
+
+                # Capture first/last for overall plan fields
+                if raw_dep_iso and first_dep_iso is None:
+                    first_dep_iso = raw_dep_iso
+                    first_dep_local_text = dep_local_text or first_dep_local_text
+                if raw_arr_iso:
+                    last_arr_iso = raw_arr_iso
+                    last_arr_local_text = arr_local_text or last_arr_local_text
+
+                # Transit metadata if available
+                line_info = td.get("transitLine", {}) or {}
+                vehicle_type = ((line_info.get("vehicle") or {}).get("type")) or "TRANSIT"
+                line_name = line_info.get("nameShort") or line_info.get("name")
+                headsign = td.get("headsign")
+                num_stops = td.get("stopCount")
+                departure_stop = (sd.get("departureStop") or {}).get("name")
+                arrival_stop = (sd.get("arrivalStop") or {}).get("name")
 
                 steps_models.append(
                     TransitStep(
-                        vehicle="TRANSIT",
-                        line_name=None,
-                        headsign=None,
-                        num_stops=None,
-                        departure_stop=None,
-                        arrival_stop=None,
-                        departure_time_local=_fmt_hhmm(raw_dep),
-                        arrival_time_local=_fmt_hhmm(raw_arr),
+                        vehicle=vehicle_type,
+                        line_name=line_name,
+                        headsign=headsign,
+                        num_stops=num_stops,
+                        departure_stop=departure_stop,
+                        arrival_stop=arrival_stop,
+                        # Use localized values directly for user display
+                        departure_time_local=dep_local_text,
+                        arrival_time_local=arr_local_text,
                     )
                 )
-                summary_parts.append("Transit")
+                tag = f"{vehicle_type}: {line_name or ''} → {headsign or ''}".strip()
+                summary_parts.append(tag)
 
         # Manual duration from first/last times
         duration_text: str | None = None
-        if first_dep and last_arr:
+        if first_dep_iso and last_arr_iso:
             try:
-                dt_dep = datetime.fromisoformat(first_dep.replace("Z", "+00:00"))
-                dt_arr = datetime.fromisoformat(last_arr.replace("Z", "+00:00"))
+                dt_dep = datetime.fromisoformat(first_dep_iso.replace("Z", "+00:00"))
+                dt_arr = datetime.fromisoformat(last_arr_iso.replace("Z", "+00:00"))
                 mins = round((dt_arr - dt_dep).total_seconds() / 60)
                 duration_text = f"{mins} mins"
             except Exception:
@@ -225,8 +245,9 @@ def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
         plans.append(
             TransitPlan(
                 summary=" › ".join(p for p in summary_parts if p) or "Transit plan",
-                departure_time_local=_fmt_hhmm(first_dep),
-                arrival_time_local=_fmt_hhmm(last_arr),
+                # Prefer localized times for display at the plan level as well
+                departure_time_local=first_dep_local_text,
+                arrival_time_local=last_arr_local_text,
                 duration_text=duration_text,
                 fare_text=None,
                 steps=steps_models,
