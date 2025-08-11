@@ -2,7 +2,7 @@ import asyncio
 import os
 from datetime import datetime
 from typing import Annotated, Literal, Any
-import json
+from textwrap import dedent
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -132,8 +132,8 @@ async def call_google_routes_v2(
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-        # Wide mask to include all transitDetails needed for times
-        "X-Goog-FieldMask": "routes.legs.steps.transitDetails,routes.duration,routes.distanceMeters",
+        # Field mask to include transit details, distance/duration, and fare info
+        "X-Goog-FieldMask": "routes.legs.steps.transitDetails,routes.duration,routes.distanceMeters,routes.travelAdvisory.transitFare",
     }
     params: dict[str, str] = {}
     if language:
@@ -157,17 +157,6 @@ async def call_google_routes_v2(
         #     pass
         return data
 
-
-def _fmt_hhmm(dt_str: str | None) -> str | None:
-    if not dt_str:
-        return None
-    try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%I:%M %p")
-    except Exception:
-        return dt_str
-
-
 def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
     plans: list[TransitPlan] = []
     for route in (resp.get("routes") or []):
@@ -178,6 +167,23 @@ def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
         first_dep_local_text: str | None = None
         last_arr_local_text: str | None = None
         summary_parts: list[str] = []
+
+        # Extract fare once per route (if present)
+        fare_text: str | None = None
+        try:
+            fare = ((route.get("travelAdvisory") or {}).get("transitFare") or {})
+            currency = fare.get("currencyCode")
+            units = fare.get("units")
+            nanos = fare.get("nanos")
+            if units is not None or nanos is not None:
+                # Format amount = units + nanos/1e9 with currency if available
+                amount = (int(units or 0)) + (float(nanos or 0) / 1_000_000_000)
+                if currency:
+                    fare_text = f"{currency} {amount:,.2f}"
+                else:
+                    fare_text = f"{amount:,.2f}"
+        except Exception:
+            fare_text = None
 
         for leg in legs:
             for step in leg.get("steps", []) or []:
@@ -249,100 +255,16 @@ def extract_transit_plans_from_routes(resp: dict) -> list[TransitPlan]:
                 departure_time_local=first_dep_local_text,
                 arrival_time_local=last_arr_local_text,
                 duration_text=duration_text,
-                fare_text=None,
+                fare_text=fare_text,
                 steps=steps_models,
             )
         )
     return plans
 
 
-def _format_epoch_to_iso_local(value: int) -> str:
-    # Google returns seconds since epoch UTC; represent in ISO8601 local time string for readability
-    dt = datetime.fromtimestamp(value)
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-
-def extract_transit_plans(directions: dict) -> list[TransitPlan]:
-    plans: list[TransitPlan] = []
-    for route in directions.get("routes", []):
-        for leg in route.get("legs", []):
-            steps: list[TransitStep] = []
-
-            dep_time = leg.get("departure_time", {}).get("value")
-            arr_time = leg.get("arrival_time", {}).get("value")
-            dep_text = leg.get("departure_time", {}).get("text")
-            arr_text = leg.get("arrival_time", {}).get("text")
-            # Prefer manual duration from arrival - departure to avoid API text inconsistencies
-            duration_text = None
-            if isinstance(dep_time, int) and isinstance(arr_time, int) and arr_time >= dep_time:
-                mins = round((arr_time - dep_time) / 60)
-                duration_text = f"{mins} mins"
-            else:
-                print("going into else")
-                duration_text = leg.get("duration", {}).get("text")
-
-            fare_text = None
-            if route.get("fare") and route["fare"].get("text"):
-                fare_text = route["fare"]["text"]
-
-            summary_parts: list[str] = []
-
-            for step in leg.get("steps", []):
-                travel_mode = step.get("travel_mode")
-                if travel_mode == "WALKING":
-                    summary_parts.append("Walk")
-                    continue
-                if travel_mode != "TRANSIT":
-                    continue
-
-                transit = step.get("transit_details", {})
-                line = transit.get("line", {})
-                vehicle = line.get("vehicle", {}).get("type", "TRANSIT")
-                line_name = line.get("name") or line.get("short_name")
-                headsign = transit.get("headsign")
-                num_stops = transit.get("num_stops")
-                departure_stop = transit.get("departure_stop", {}).get("name")
-                arrival_stop = transit.get("arrival_stop", {}).get("name")
-                dep_local = None
-                arr_local = None
-                if transit.get("departure_time", {}).get("value"):
-                    dep_local = _format_epoch_to_iso_local(transit["departure_time"]["value"])
-                if transit.get("arrival_time", {}).get("value"):
-                    arr_local = _format_epoch_to_iso_local(transit["arrival_time"]["value"])
-
-                steps.append(
-                    TransitStep(
-                        vehicle=vehicle,
-                        line_name=line_name,
-                        headsign=headsign,
-                        num_stops=num_stops,
-                        departure_stop=departure_stop,
-                        arrival_stop=arrival_stop,
-                        departure_time_local=dep_local,
-                        arrival_time_local=arr_local,
-                    )
-                )
-
-                tag = f"{vehicle}: {line_name or ''} → {headsign or ''}".strip()
-                summary_parts.append(tag)
-
-            summary = " › ".join(p for p in summary_parts if p)
-            plans.append(
-                TransitPlan(
-                    summary=summary or "Transit plan",
-                    departure_time_local=dep_text or (dep_time and _format_epoch_to_iso_local(dep_time)) or None,
-                    arrival_time_local=arr_text or (arr_time and _format_epoch_to_iso_local(arr_time)) or None,
-                    duration_text=duration_text,
-                    fare_text=fare_text,
-                    steps=steps,
-                )
-            )
-    return plans
-
-
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Google Transit MCP Server",
+    "Instant Transit",
     auth=SimpleBearerAuthProvider(AUTH_TOKEN),
 )
 
@@ -351,6 +273,22 @@ mcp = FastMCP(
 async def validate() -> str:
     # Mirror the pattern from the bearer-token server; if MY_NUMBER is set, return it.
     return MY_NUMBER or "google-transit:ok"
+
+
+@mcp.tool
+async def about() -> dict[str, str]:
+    server_name = "Instant Transit details"
+    server_description = dedent(
+        """
+        This MCP server helps discover public transit routes and upcoming departures between an origin and destination, with optional filtering by mode (bus,
+        subway/metro), and preferred departure time. It also provides the fare details for the transit routes.
+
+        Just ask "When is the next metro from X to Y" or "What is the cost of the bus from X to Y"
+        and get instant answers!
+        """
+    ).strip()
+
+    return {"name": server_name, "description": server_description}
 
 
 TRANSIT_DESCRIPTION = RichToolDescription(
@@ -500,7 +438,7 @@ async def transit_route(
 
 
 async def main():
-    print("🚦 Starting Google Transit MCP server on http://0.0.0.0:8087")
+    print("🚦 Starting Instant Transit MCP server on http://0.0.0.0:8087")
     await mcp.run_async("streamable-http", host="0.0.0.0", port=8087)
 
 
