@@ -282,9 +282,6 @@ async def about() -> dict[str, str]:
         """
         This MCP server helps discover public transit routes and upcoming departures between an origin and destination, with optional filtering by mode (bus,
         subway/metro), and preferred departure time. It also provides the fare details for the transit routes.
-
-        Just ask "When is the next metro from X to Y" or "What is the cost of the bus from X to Y"
-        and get instant answers!
         """
     ).strip()
 
@@ -293,7 +290,7 @@ async def about() -> dict[str, str]:
 
 TRANSIT_DESCRIPTION = RichToolDescription(
     description=(
-        "Discover public transit routes and upcoming departures between an origin and destination, with optional filtering by mode (bus, subway/metro), and preferred departure time. It also provides the fare details for the transit routes. Just ask 'When is the next metro from X to Y' or 'What is the cost of the bus from X to Y' and get instant answers!"
+        "Just ask 'When is the next metro from X to Y' or 'What is the cost of the bus from X to Y' and get instant answers!"
     ),
     use_when=(
         "Use for queries like 'next bus from A to B', 'metro to X from Y', or 'when should I leave to catch the next train' or 'what is the cost of the bus from A to B' or 'what is the cost of the metro from A to B'."
@@ -371,14 +368,6 @@ async def transit_route(
                 ),
             )
         )
-
-    # Mode normalization for Google 'transit_mode'
-    transit_mode = None
-    if mode:
-        if mode == "metro":
-            transit_mode = "subway"
-        else:
-            transit_mode = mode
 
     # Time handling
     if depart_at_iso and arrive_by_iso:
